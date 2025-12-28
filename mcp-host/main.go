@@ -1,3 +1,4 @@
+// host/main.go
 package main
 
 import (
@@ -26,7 +27,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Println("[Host] Token from AS:", tokenResp.JWS)
+	log.Println("[Host] Received token from AS:", tokenResp.JWS)
+	log.Println("[Host] Received keys order from AS:", tokenResp.Keys)
+	log.Println("[Host] Received leaves from AS:", len(tokenResp.Leaves))
 
 	// 2️⃣ Cria disclosure seletiva do Host (ex.: só "repo.write")
 	log.Println("[Host] Creating selective disclosure for 'repo.write'")
@@ -39,7 +42,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	hostDiscJSON, _ := hostDisc.ToJSON()
+	hostDiscJSON, err := hostDisc.ToJSON()
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("[Host] Created disclosure for 'repo.write':", string(hostDiscJSON))
 
 	// 3️⃣ Conecta MCP ao Server1
 	client := mcp.NewClient(&mcp.Implementation{Name: "server1"}, nil)
@@ -50,13 +57,13 @@ func main() {
 	}
 	defer session.Close()
 
-	// 4️⃣ Envia token + disclosure ao Server1
+	// 4️⃣ Envia token + presentations ao Server1
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "process",
 		Arguments: map[string]any{
-			"token":      tokenResp.JWS,
-			"disclosure": string(hostDiscJSON),
-			"leaves":     tokenResp.Leaves,
+			"token":         tokenResp.JWS,
+			"presentations": []string{string(hostDiscJSON)}, // index 0 = AS
+			"leaves":        tokenResp.Leaves,
 		},
 	})
 	if err != nil {
@@ -75,7 +82,6 @@ func main() {
 		log.Fatal("[Host] Empty response from Server1")
 	}
 
-	// Converte o resultado MCP para JSON
 	rawJSON := make(map[string]string)
 	for _, c := range result.Content {
 		if t, ok := c.(*mcp.TextContent); ok {
@@ -102,7 +108,8 @@ func main() {
 		log.Fatal("[Host] Server2 failed:", server1Resp.Server2Error)
 	}
 
-	// 7️⃣ Valida token + disclosures localmente
+	// 7️⃣ Valida token + presentations localmente (por segurança)
+	// Reconstrói disclosures map: 0 -> hostDisc, 1 -> server1 disc (do response)
 	disclosureMap := map[int]*sd.Disclosure{
 		0: hostDisc,
 		1: mustSDFromJSON(server1Resp.Server1Disc),

@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	sd "github.com/marques-ma/merkle-selective-disclosure"
+	// sd "github.com/marques-ma/merkle-selective-disclosure"
 	jwtld "github.com/marques-ma/jwt-ld"
 	"github.com/hpe-usp-spire/schoco"
 )
@@ -57,6 +57,9 @@ func issueTokenHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	// payload.Data agora contém apenas { "sd": { "alg":"sha256-merkle", "root":"<b64>" } }
 	log.Println("[AS] SD root attached to payload")
+	log.Println("[AS] Leaves order:", keys)
+	log.Println("[AS] Leaves count:", len(leaves))
+	log.Println("[AS] Payload after attach (Data metadata):", payload.Data)	
 
 	// === 4) Create JWS signing the payload ===
 	jws, err := jwtld.CreateJWS(payload, 1, rootSk)
@@ -65,20 +68,12 @@ func issueTokenHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// === 5) Create global disclosure (all leaves) to hand to the holder ===
-	rootDisc, err := sd.CreateDisclosure(leaves, nil) // nil = reveal all leaves (holder can choose later)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	rootJSON, _ := rootDisc.ToJSON()
-
 	// === 6) Response (compatible com a PoC/Host atual) ===
 	resp := map[string]any{
 		"jws":         jws,
 		"keys":        keys,
 		"leaves":      leaves,
-		"disclosures": []string{string(rootJSON)},
+		// "disclosures": []string{string(rootJSON)},
 	}
 
 	b, _ := json.MarshalIndent(resp, "", "  ")
@@ -86,4 +81,5 @@ func issueTokenHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(b)
 
 	log.Println("[AS] Token issued following test flow (AttachSDRootToPayload -> sign -> disclosure)")
+	log.Println("[AS] Response contents:", resp)
 }

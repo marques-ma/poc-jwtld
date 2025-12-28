@@ -24,20 +24,18 @@ func main() {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "process",
-		Description: "Validate AS disclosure, extend token, send to Server2",
+		Description: "Validate AS presentation, extend token, send to Server2",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, rawArgs map[string]any) (*mcp.CallToolResult, any, error) {
 		var args struct {
-			Token      string `json:"token"`
-			Disclosure string `json:"disclosure"`
+			Token         string   `json:"token"`
+			Presentations []string `json:"presentations"` // array aligned by node index
 		}
 		b, _ := json.Marshal(rawArgs)
 		if err := json.Unmarshal(b, &args); err != nil {
 			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: "ERROR: failed to parse arguments: " + err.Error()}},
-			}, nil, nil
+				Content: []mcp.Content{&mcp.TextContent{Text: "ERROR: failed to parse arguments: " + err.Error()}}}, nil, nil
 		}
-
-		return processTool(ctx, args.Token, args.Disclosure)
+		return processTool(ctx, args.Token, args.Presentations)
 	})
 
 	handler := mcp.NewStreamableHTTPHandler(func(req *http.Request) *mcp.Server {
@@ -48,73 +46,77 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8081", handler))
 }
 
-// ---------------- Core Tool ----------------
+func processTool(ctx context.Context, token string, presentations []string) (*mcp.CallToolResult, any, error) {
+	log.Println("[Server1] Received token + Host presentation")
 
-func processTool(ctx context.Context, token string, disclosure string) (*mcp.CallToolResult, any, error) {
-	log.Println("[Server1] Received token + AS disclosure")
-
-	// Parse AS disclosure
-	asDisc, err := sd.FromJSON([]byte(disclosure))
-	if err != nil {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "ERROR: AS disclosure parse error: " + err.Error()}},
-		}, nil, nil
+	// 1️⃣ Build presentations map[int]*sd.Disclosure from incoming array
+	presMap := map[int]*sd.Disclosure{}
+	for i, pStr := range presentations {
+		d, err := sd.FromJSON([]byte(pStr))
+		if err != nil {
+			log.Printf("[Server1] ❌ Failed to parse presentation %d: %v\n", i, err)
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: "ERROR: invalid presentation: " + err.Error()}}}, nil, nil
+		}
+		presMap[i] = d
 	}
 
-	// Validate token with AS disclosure
-	ok, err := jwtld.ValidateJWSWithPresentations(token, 1, map[int]*sd.Disclosure{0: asDisc})
+	// 2️⃣ Validate token with provided presentations
+	ok, err := jwtld.ValidateJWSWithPresentations(token, 1, presMap)
 	if err != nil || !ok {
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "ERROR: token validation failed: " + err.Error()}},
-		}, nil, nil
+			Content: []mcp.Content{&mcp.TextContent{Text: "ERROR: token validation failed: " + err.Error()}}}, nil, nil
 	}
-	log.Println("[Server1] ✔ Token validated with AS disclosure")
+	log.Println("[Server1] ✔ Token validated with provided presentations")
 
-	// --- Create node for Server1 ---
-	rootPayload := &jwtld.Payload{
+	// 3️⃣ Create Server1 node and attach SD root
+	server1Payload := &jwtld.Payload{
 		Ver: 1,
 		Iat: time.Now().Unix(),
 		Iss: &jwtld.IDClaim{CN: "spiffe://example.org/server1"},
 	}
-	nodeClaims := map[string]interface{}{
-		"service": "server1",
-		"allow":   true,
+	server1Claims := map[string]interface{}{
+		"execute": true,
+		"pull":    true,
 	}
-	_, leaves, err := jwtld.AttachSDRootToPayload(rootPayload, nodeClaims)
+	_, _, err = jwtld.AttachSDRootToPayload(server1Payload, server1Claims)
 	if err != nil {
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "ERROR: attach SD root failed: " + err.Error()}},
-		}, nil, nil
+			Content: []mcp.Content{&mcp.TextContent{Text: "ERROR: attach SD root failed: " + err.Error()}}}, nil, nil
 	}
 
-	// Create disclosure for Server1 node (all claims)
-	nodeDisc, _ := sd.CreateDisclosure(leaves, nil)
-	nodeDiscJSON, _ := nodeDisc.ToJSON()
-	nodeDiscStr := string(nodeDiscJSON)
+	// 4️⃣ Create disclosure for Server1 node
+	selectedKeys := []string{"execute", "pull"}
+	nodeDisc, err := jwtld.CreatePresentationFromData(server1Claims, selectedKeys)
+	if err != nil {
+		log.Fatal(err)
+	}
+	nodeDiscJSON, _ := json.Marshal(nodeDisc)
 
-	// Extend token
-	node := &jwtld.LDNode{Payload: rootPayload}
+	// 5️⃣ Extend token with new node
+	node := &jwtld.LDNode{Payload: server1Payload}
 	extendedToken, err := jwtld.ExtendJWS(token, node, 1)
 	if err != nil {
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "ERROR: extend JWS failed: " + err.Error()}},
-		}, nil, nil
+			Content: []mcp.Content{&mcp.TextContent{Text: "ERROR: extend JWS failed: " + err.Error()}}}, nil, nil
 	}
 	log.Println("[Server1] Extended token created")
 
-	// --- Send to Server2 and wait for response ---
-	reqBody := map[string]any{
-		"token":       extendedToken,
-		"disclosures": []string{disclosure, nodeDiscStr},
+	// 6️⃣ Send to Server2
+	reqBody := map[string]*sd.Disclosure{
+		"0": presMap[0],
+		"1": nodeDisc,
 	}
-	b, _ := json.Marshal(reqBody)
+	b, _ := json.Marshal(map[string]interface{}{
+		"token":         extendedToken,
+		"presentations": reqBody,
+	})
 
 	resp, err := http.Post(server2URL, "application/json", bytes.NewReader(b))
 	if err != nil {
 		log.Println("[Server1] ❌ Post to Server2 failed:", err)
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "ERROR: Server2 call failed: " + err.Error()}},
-		}, nil, nil
+			Content: []mcp.Content{&mcp.TextContent{Text: "ERROR: Server2 call failed: " + err.Error()}}}, nil, nil
 	}
 	defer resp.Body.Close()
 
@@ -122,25 +124,24 @@ func processTool(ctx context.Context, token string, disclosure string) (*mcp.Cal
 	if resp.StatusCode != http.StatusOK {
 		log.Println("[Server1] ❌ Server2 returned error:", string(respBody))
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "ERROR: Server2 response: " + string(respBody)}},
-		}, nil, nil
+			Content: []mcp.Content{&mcp.TextContent{Text: "ERROR: Server2 response: " + string(respBody)}}}, nil, nil
 	}
 
 	log.Println("[Server1] ✔ Server2 execution succeeded")
 
-	// --- Retorna token estendido + resposta do Server2 ---
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{
-			&mcp.TextContent{Text: string(jsonMustMarshal(map[string]string{
-				"extended_token":     extendedToken,
-				"server1_disclosure": nodeDiscStr,        // disclosure do Server1 incluído
-				"server2_response":   string(respBody),   // resposta do Server2
-			}))},
+			&mcp.TextContent{
+				Text: string(jsonMustMarshal(map[string]string{
+					"extended_token":     extendedToken,
+					"server1_disclosure": string(nodeDiscJSON),
+					"server2_response":   string(respBody),
+				})),
+			},
 		},
 	}, nil, nil
 }
 
-// jsonMustMarshal ignora erro de Marshal
 func jsonMustMarshal(v any) []byte {
 	b, _ := json.Marshal(v)
 	return b
